@@ -234,7 +234,10 @@ Treat the output as a secret even though it is short-lived. Set the audience in 
 ## Deployment
 
 - `docker-compose.yml` runs a local development stack with PostgreSQL and MinIO.
-- `charts/mbx-cache` runs a horizontally scalable Kubernetes deployment.
+- `charts/mbx-cache` runs a horizontally scalable Kubernetes deployment. It can
+  read the database URL from a Secret (`config.databaseUrlSecretRef`), pin the
+  image by digest, and take `extraEnv`, `envFrom`, ServiceAccount and Service
+  annotations (for example GKE Workload Identity or NEGs), and scheduling values.
 - [`deploy/azure`](deploy/azure/README.md) provisions a low-cost US production
   instance with Terraform and converges its host with `mise bootstrap remote`.
   Cache blobs use Azure Blob Storage in the same region.

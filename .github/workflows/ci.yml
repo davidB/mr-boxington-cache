@@ -74,6 +74,14 @@ jobs:
           check custom custom --set serviceAccount.name=custom
           check none existing --set serviceAccount.create=false --set serviceAccount.name=existing
           check none default --set serviceAccount.create=false
+          ext=$(helm template ext charts/mbx-cache \
+            --set config.s3Bucket=cache \
+            --set config.databaseUrlSecretRef.name=db \
+            --set config.databaseUrlSecretRef.key=uri \
+            --set image.digest=sha256:0000000000000000000000000000000000000000000000000000000000000000)
+          grep -q 'secretKeyRef: {name: "db", key: "uri"}' <<<"$ext"
+          grep -q 'image: "ghcr.io/jdx/mbx-cache@sha256:0' <<<"$ext"
+          grep -q 'runAsUser: 65532' <<<"$ext"
           helm template azure charts/mbx-cache \
             --set config.storage=azure \
             --set config.databaseUrl=postgres://cache/cache \

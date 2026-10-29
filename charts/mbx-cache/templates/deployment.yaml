@@ -12,16 +12,21 @@ spec:
       annotations: {{ toYaml .Values.podAnnotations | nindent 8 }}
     spec:
       serviceAccountName: {{ include "mbx-cache.serviceAccountName" . }}
-      securityContext: {runAsNonRoot: true, seccompProfile: {type: RuntimeDefault}}
+      securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
         - name: mbx-cache
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          image: "{{ .Values.image.repository }}{{ with .Values.image.digest }}@{{ . }}{{ else }}:{{ .Values.image.tag }}{{ end }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: ["ALL"]}}
           ports: [{name: http, containerPort: 8080}]
           env:
             - {name: MBX_CACHE_STORAGE, value: {{ .Values.config.storage | quote }}}
-            - {name: MBX_CACHE_DATABASE_URL, value: {{ required "config.databaseUrl is required" .Values.config.databaseUrl | quote }}}
+            {{- with .Values.config.databaseUrlSecretRef }}
+            - name: MBX_CACHE_DATABASE_URL
+              valueFrom: {secretKeyRef: {name: {{ required "config.databaseUrlSecretRef.name is required" .name | quote }}, key: {{ required "config.databaseUrlSecretRef.key is required" .key | quote }}}}
+            {{- else }}
+            - {name: MBX_CACHE_DATABASE_URL, value: {{ required "config.databaseUrl or config.databaseUrlSecretRef is required" .Values.config.databaseUrl | quote }}}
+            {{- end }}
             - {name: MBX_CACHE_DATABASE_MAX_CONNECTIONS, value: {{ .Values.config.databaseMaxConnections | quote }}}
             {{- if eq .Values.config.storage "azure" }}
             - {name: MBX_CACHE_AZURE_ACCOUNT, value: {{ required "config.azureAccount is required for Azure storage" .Values.config.azureAccount | quote }}}
@@ -44,8 +49,23 @@ spec:
               valueFrom: {secretKeyRef: {name: {{ .Values.secret.existingSecret }}, key: {{ .Values.secret.tokensKey }}, optional: true}}
             - name: MBX_CACHE_OIDC_PROVIDERS_JSON
               valueFrom: {secretKeyRef: {name: {{ .Values.secret.existingSecret }}, key: {{ .Values.secret.oidcProvidersKey }}, optional: true}}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.envFrom }}
+          envFrom: {{- toYaml . | nindent 12 }}
+          {{- end }}
           readinessProbe: {httpGet: {path: /v1/status, port: http}, initialDelaySeconds: 2}
           livenessProbe: {httpGet: {path: /v1/status, port: http}, initialDelaySeconds: 5}
           resources: {{ toYaml .Values.resources | nindent 12 }}
           volumeMounts: [{name: tmp, mountPath: /tmp}]
       volumes: [{name: tmp, emptyDir: {}}]
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
