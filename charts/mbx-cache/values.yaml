@@ -2,15 +2,20 @@ replicaCount: 2
 image:
   repository: ghcr.io/jdx/mbx-cache
   tag: latest
+  # Pins the image by digest (sha256:...); takes precedence over tag.
+  digest: ""
   pullPolicy: IfNotPresent
 service:
   port: 8080
+  annotations: {}
 resources:
   requests: {cpu: 100m, memory: 128Mi}
   limits: {memory: 512Mi}
 config:
   storage: s3
   databaseUrl: ""
+  # Reads the URL from a Secret ({name, key}) instead of databaseUrl.
+  databaseUrlSecretRef: {}
   databaseMaxConnections: 32
   azureAccount: ""
   azureContainer: ""
@@ -31,6 +36,7 @@ secret:
 serviceAccount:
   create: true
   name: ""
+  annotations: {}
 podAnnotations: {}
 # distroless `nonroot` is uid 65532; the kubelet cannot check a non-numeric
 # image USER against runAsNonRoot, so the ids are set explicitly.
@@ -39,6 +45,11 @@ podSecurityContext:
   runAsUser: 65532
   runAsGroup: 65532
   seccompProfile: {type: RuntimeDefault}
+extraEnv: []
+envFrom: []
+nodeSelector: {}
+tolerations: []
+affinity: {}
 serviceMonitor:
   enabled: false
 networkPolicy:

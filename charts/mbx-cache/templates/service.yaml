@@ -3,6 +3,9 @@ kind: Service
 metadata:
   name: {{ .Release.Name }}-mbx-cache
   labels: {app.kubernetes.io/name: mbx-cache, app.kubernetes.io/instance: {{ .Release.Name }}}
+  {{- with .Values.service.annotations }}
+  annotations: {{- toYaml . | nindent 4 }}
+  {{- end }}
 spec:
   selector: {app.kubernetes.io/name: mbx-cache, app.kubernetes.io/instance: {{ .Release.Name }}}
   ports:
