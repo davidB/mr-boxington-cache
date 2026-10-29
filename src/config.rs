@@ -6,6 +6,7 @@ use std::path::PathBuf;
 pub enum StorageKind {
     Azure,
     Filesystem,
+    Gcs,
     S3,
 }
 
@@ -67,6 +68,12 @@ pub struct Config {
 
     #[arg(long, env = "MBX_CACHE_AZURE_ALLOW_HTTP", default_value_t = false)]
     pub azure_allow_http: bool,
+
+    #[arg(long, env = "MBX_CACHE_GCS_BUCKET")]
+    pub gcs_bucket: Option<String>,
+
+    #[arg(long, env = "MBX_CACHE_GCS_PREFIX", default_value = "v1")]
+    pub gcs_prefix: String,
 
     #[arg(long, env = "MBX_CACHE_S3_BUCKET")]
     pub s3_bucket: Option<String>,

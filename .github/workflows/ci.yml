@@ -79,6 +79,10 @@ jobs:
             --set config.databaseUrl=postgres://cache/cache \
             --set config.azureAccount=mbxcache \
             --set config.azureContainer=cache >/dev/null
+          helm template gcs charts/mbx-cache \
+            --set config.storage=gcs \
+            --set config.databaseUrl=postgres://cache/cache \
+            --set config.gcsBucket=cache | grep -q 'name: MBX_CACHE_GCS_BUCKET, value: "cache"'
       - run: shellcheck deploy/azure/deploy.sh deploy/azure/test-deploy.sh
       - run: deploy/azure/test-deploy.sh
   hk:

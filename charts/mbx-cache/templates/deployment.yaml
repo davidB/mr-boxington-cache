@@ -32,6 +32,9 @@ spec:
             - {name: MBX_CACHE_AZURE_ENDPOINT, value: {{ . | quote }}}
             {{- end }}
             - {name: MBX_CACHE_AZURE_ALLOW_HTTP, value: {{ .Values.config.azureAllowHttp | quote }}}
+            {{- else if eq .Values.config.storage "gcs" }}
+            - {name: MBX_CACHE_GCS_BUCKET, value: {{ required "config.gcsBucket is required for GCS storage" .Values.config.gcsBucket | quote }}}
+            - {name: MBX_CACHE_GCS_PREFIX, value: {{ .Values.config.gcsPrefix | quote }}}
             {{- else if eq .Values.config.storage "s3" }}
             - {name: MBX_CACHE_S3_BUCKET, value: {{ required "config.s3Bucket is required" .Values.config.s3Bucket | quote }}}
             - {name: MBX_CACHE_S3_PREFIX, value: {{ .Values.config.s3Prefix | quote }}}
