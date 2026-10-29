@@ -12,7 +12,7 @@ spec:
       annotations: {{ toYaml .Values.podAnnotations | nindent 8 }}
     spec:
       serviceAccountName: {{ include "mbx-cache.serviceAccountName" . }}
-      securityContext: {runAsNonRoot: true, seccompProfile: {type: RuntimeDefault}}
+      securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
         - name: mbx-cache
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"

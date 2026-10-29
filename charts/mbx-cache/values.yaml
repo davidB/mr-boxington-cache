@@ -32,6 +32,13 @@ serviceAccount:
   create: true
   name: ""
 podAnnotations: {}
+# distroless `nonroot` is uid 65532; the kubelet cannot check a non-numeric
+# image USER against runAsNonRoot, so the ids are set explicitly.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  seccompProfile: {type: RuntimeDefault}
 serviceMonitor:
   enabled: false
 networkPolicy:
