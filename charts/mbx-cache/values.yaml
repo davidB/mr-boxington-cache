@@ -23,6 +23,8 @@ config:
   azureCredentialType: auto
   azureEndpoint: ""
   azureAllowHttp: false
+  gcsBucket: ""
+  gcsPrefix: v1
   s3Bucket: ""
   s3Prefix: v1
   s3Region: us-east-1
