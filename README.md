@@ -110,9 +110,13 @@ Every option has a matching environment variable and CLI flag. Run `mbx-cache --
 AWS credentials use the standard AWS SDK credential chain, including environment variables, workload identity, ECS, and EC2 roles.
 Azure credentials are discovered by the object-store client. The production
 deployment uses the VM's managed identity and stores no account key.
-GCS credentials are discovered by the object-store client too: a service
-account key from `GOOGLE_SERVICE_ACCOUNT` or `GOOGLE_APPLICATION_CREDENTIALS`,
+GCS credentials are discovered by the object-store client too:
+`GOOGLE_SERVICE_ACCOUNT` points to a service-account file and
+`GOOGLE_SERVICE_ACCOUNT_KEY` holds its serialized JSON. Without either, the
+client uses Application Default Credentials (`GOOGLE_APPLICATION_CREDENTIALS`),
 then the metadata server, which serves GKE Workload Identity, so no key is needed.
+A GCS request has no overall timeout below 1 hour and fails after 30 seconds
+without data; set `GOOGLE_TIMEOUT` or `GOOGLE_READ_TIMEOUT` to change them.
 
 ### Authorization
 

@@ -1,8 +1,11 @@
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use object_store::{
-    CopyMode, CopyOptions, Error, ObjectStore, ObjectStoreExt, PutMode, PutOptions,
-    buffered::BufWriter, gcp::GoogleCloudStorageBuilder, path::Path as ObjectPath,
+    ClientConfigKey, CopyMode, CopyOptions, Error, ObjectStore, ObjectStoreExt, PutMode,
+    PutOptions,
+    buffered::BufWriter,
+    gcp::{GoogleCloudStorageBuilder, GoogleConfigKey},
+    path::Path as ObjectPath,
 };
 use std::{io, path::Path, sync::Arc};
 use tokio::io::{AsyncWriteExt, BufReader};
@@ -25,7 +28,17 @@ impl GcsStore {
             .ok_or_else(|| anyhow::anyhow!("--gcs-bucket is required with GCS storage"))?;
         // Without a service account key, the client falls back to application
         // default credentials and then the metadata server (GKE Workload Identity).
-        let builder = GoogleCloudStorageBuilder::from_env().with_bucket_name(bucket);
+        let mut builder = GoogleCloudStorageBuilder::from_env().with_bucket_name(bucket);
+        // A blob read streams to the client at its pace, so object_store's default
+        // 30s overall timeout would cut large downloads; bound idle reads instead.
+        // GOOGLE_TIMEOUT and GOOGLE_READ_TIMEOUT still override both.
+        if std::env::var_os("GOOGLE_TIMEOUT").is_none() {
+            builder = builder.with_config(GoogleConfigKey::Client(ClientConfigKey::Timeout), "1h");
+        }
+        if std::env::var_os("GOOGLE_READ_TIMEOUT").is_none() {
+            builder =
+                builder.with_config(GoogleConfigKey::Client(ClientConfigKey::ReadTimeout), "30s");
+        }
         Ok(Self::from_store(
             Arc::new(builder.build()?),
             &config.gcs_prefix,
@@ -142,6 +155,15 @@ mod tests {
             true,
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn builds_with_the_default_timeouts() {
+        use clap::Parser;
+        let config =
+            Config::try_parse_from(["mbx-cache", "--storage", "gcs", "--gcs-bucket", "cache"])
+                .unwrap();
+        GcsStore::new(&config).await.unwrap();
     }
 
     /// Set `MBX_CACHE_TEST_FAKE_GCS` to a fake-gcs-server URL with a `cache` bucket.
