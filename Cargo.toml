@@ -33,7 +33,7 @@ hex = "0.4"
 http = "1"
 jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 mbx-cache-protocol = "0.5.2"
-object_store = { version = "0.14.1", default-features = false, features = ["azure"] }
+object_store = { version = "0.14.1", default-features = false, features = ["azure", "gcp"] }
 prometheus-client = "0.25"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 serde = { version = "1", features = ["derive"] }

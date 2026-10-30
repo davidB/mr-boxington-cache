@@ -84,7 +84,7 @@ Every option has a matching environment variable and CLI flag. Run `mbx-cache --
 | Environment variable | Default | Purpose |
 |---|---:|---|
 | `MBX_CACHE_LISTEN` | `0.0.0.0:8080` | Listen address |
-| `MBX_CACHE_STORAGE` | `filesystem` | `filesystem`, `s3`, or `azure` |
+| `MBX_CACHE_STORAGE` | `filesystem` | `filesystem`, `s3`, `azure`, or `gcs` |
 | `MBX_CACHE_DATA_DIR` | `/var/lib/mbx-cache` | Filesystem blob root |
 | `MBX_CACHE_DATABASE_URL` | `memory://` | PostgreSQL URL or development memory store |
 | `MBX_CACHE_DATABASE_MAX_CONNECTIONS` | `32` | Maximum concurrent PostgreSQL metadata connections |
@@ -94,6 +94,8 @@ Every option has a matching environment variable and CLI flag. Run `mbx-cache --
 | `MBX_CACHE_AZURE_CREDENTIAL_TYPE` | `auto` | Azure credential discovery mode; use `managed_identity` on Azure VMs |
 | `MBX_CACHE_AZURE_ENDPOINT` | Azure default | Override for compatible emulators |
 | `MBX_CACHE_AZURE_ALLOW_HTTP` | `false` | Allow an HTTP emulator endpoint |
+| `MBX_CACHE_GCS_BUCKET` | — | Required Google Cloud Storage bucket name |
+| `MBX_CACHE_GCS_PREFIX` | `v1` | GCS object-key prefix |
 | `MBX_CACHE_S3_BUCKET` | — | Required for S3 storage |
 | `MBX_CACHE_S3_PREFIX` | `v1` | Object-key prefix |
 | `MBX_CACHE_S3_ENDPOINT` | AWS default | S3-compatible endpoint |
@@ -108,6 +110,13 @@ Every option has a matching environment variable and CLI flag. Run `mbx-cache --
 AWS credentials use the standard AWS SDK credential chain, including environment variables, workload identity, ECS, and EC2 roles.
 Azure credentials are discovered by the object-store client. The production
 deployment uses the VM's managed identity and stores no account key.
+GCS credentials are discovered by the object-store client too:
+`GOOGLE_SERVICE_ACCOUNT` points to a service-account file and
+`GOOGLE_SERVICE_ACCOUNT_KEY` holds its serialized JSON. Without either, the
+client uses Application Default Credentials (`GOOGLE_APPLICATION_CREDENTIALS`),
+then the metadata server, which serves GKE Workload Identity, so no key is needed.
+A GCS request has no overall timeout below 1 hour and fails after 30 seconds
+without data; set `GOOGLE_TIMEOUT` or `GOOGLE_READ_TIMEOUT` to change them.
 
 ### Authorization
 
@@ -274,8 +283,9 @@ Servers advertising `features.action_batch` answer `POST /v1/action-results:batc
 ### Bounding storage
 
 Blob storage is expired by the object store's lifecycle policy (an S3 bucket
-lifecycle rule or an Azure Blob lifecycle management rule); `mbx-cache` removes
-the metadata those objects leave behind and exits without serving:
+lifecycle rule, an Azure Blob lifecycle management rule, or a GCS Object
+Lifecycle Management rule); `mbx-cache` removes the metadata those objects
+leave behind and exits without serving:
 
 ```sh
 mbx-cache --sweep-metadata-older-than-days 35
