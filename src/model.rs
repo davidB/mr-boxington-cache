@@ -7,8 +7,10 @@ pub use mbx_cache_protocol::{
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashSet};
 
+// Action descriptors are opaque cache keys, and the client adds fields to them
+// without a schema bump. Unknown fields are ignored rather than denied, so a
+// newer client stays cacheable; the fields below are the ones still validated.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct TaskAction {
     pub version: u8,
     pub kind: String,
@@ -47,7 +49,6 @@ pub enum TaskRunEntry {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct TaskRunSingle {
     pub task: String,
     #[serde(default)]
@@ -57,13 +58,11 @@ pub struct TaskRunSingle {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct TaskRunGroup {
     pub tasks: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct TaskCommandInput {
     pub command: String,
     pub stdout_hash: String,
@@ -97,7 +96,6 @@ pub enum TaskOutputStream {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct RustcAction {
     pub version: u8,
     pub kind: String,
@@ -111,15 +109,15 @@ pub struct RustcAction {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct RustcCompiler {
     pub toolchain: String,
     pub rustc_version: String,
     pub host: String,
+    #[serde(default)]
+    pub driver: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct RustcInput {
     pub path: String,
     /// Identifies local input content for the action key. This is not a CAS
@@ -128,7 +126,6 @@ pub struct RustcInput {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct RustcLinkerIdentity {
     pub driver: String,
     pub driver_version: String,
@@ -142,13 +139,16 @@ pub struct RustcLinkerIdentity {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct CcAction {
     pub version: u8,
     pub kind: String,
     pub adapter_version: u8,
     #[serde(default)]
     pub assembly_input_model: Option<u8>,
+    #[serde(default)]
+    pub path_binding: Option<CcPathBinding>,
+    #[serde(default)]
+    pub preprocessing: Option<CcPreprocessing>,
     pub compiler: CcCompiler,
     pub arguments: Vec<String>,
     pub environment: BTreeMap<String, Option<String>>,
@@ -156,7 +156,35 @@ pub struct CcAction {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+pub struct CcPathBinding {
+    pub working_dir: String,
+    pub arguments: Vec<CcArgument>,
+    pub roots: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub enum CcArgument {
+    Plain(String),
+    Path {
+        flag: String,
+        path: String,
+    },
+    PrefixMap {
+        flag: String,
+        from: String,
+        to: String,
+    },
+    Source(String),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CcPreprocessing {
+    pub working_dir: String,
+    pub arguments: Vec<String>,
+    pub roots: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct CcCompiler {
     pub assembler: String,
     pub family: String,
@@ -165,28 +193,34 @@ pub struct CcCompiler {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct CcInput {
     pub digest: Digest,
     pub path: String,
 }
 
+/// Schema 3 added `archive_timestamps`; 4 and 5 changed only what the client keys.
+pub const BUILD_SCRIPT_ACTION_SCHEMAS: std::ops::RangeInclusive<u8> = 2..=5;
+
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct BuildScriptAction {
     pub version: u8,
     pub kind: String,
+    #[serde(default)]
+    pub archive_timestamps: Option<String>,
     pub binary_action: Digest,
     pub cargo_environment: BTreeMap<String, Option<String>>,
+    #[serde(default)]
+    pub checkout: Option<String>,
     pub environment: BTreeMap<String, Option<String>>,
     pub inputs: BTreeMap<String, BuildScriptInput>,
     pub out_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BuildScriptInput {
     Missing,
+    BlockedByFile,
     File {
         digest: Digest,
     },
@@ -317,6 +351,7 @@ impl RustcCompiler {
     fn validate(&self) -> bool {
         [&self.toolchain, &self.rustc_version, &self.host]
             .into_iter()
+            .chain(&self.driver)
             .all(|value| !value.is_empty() && valid_string(value))
     }
 }
@@ -353,6 +388,14 @@ impl CcAction {
             && self.kind == "cc"
             && self.adapter_version > 0
             && self.assembly_input_model.is_none_or(|version| version == 1)
+            && self
+                .path_binding
+                .as_ref()
+                .is_none_or(CcPathBinding::validate)
+            && self
+                .preprocessing
+                .as_ref()
+                .is_none_or(CcPreprocessing::validate)
             && self.compiler.validate()
             && valid_strings(&self.arguments)
             && valid_optional_string_map(&self.environment)
@@ -361,6 +404,34 @@ impl CcAction {
                 .inputs
                 .iter()
                 .all(|input| input.validate() && input_paths.insert(&input.path))
+    }
+}
+
+impl CcPathBinding {
+    fn validate(&self) -> bool {
+        valid_string(&self.working_dir)
+            && self.arguments.iter().all(CcArgument::validate)
+            && valid_string_map(&self.roots)
+    }
+}
+
+impl CcArgument {
+    fn validate(&self) -> bool {
+        match self {
+            Self::Plain(value) | Self::Source(value) => valid_string(value),
+            Self::Path { flag, path } => valid_string(flag) && valid_string(path),
+            Self::PrefixMap { flag, from, to } => {
+                valid_string(flag) && valid_string(from) && valid_string(to)
+            }
+        }
+    }
+}
+
+impl CcPreprocessing {
+    fn validate(&self) -> bool {
+        valid_string(&self.working_dir)
+            && valid_strings(&self.arguments)
+            && valid_string_map(&self.roots)
     }
 }
 
@@ -385,8 +456,9 @@ impl CcInput {
 
 impl BuildScriptAction {
     pub fn validate(&self) -> bool {
-        self.version == 2
+        BUILD_SCRIPT_ACTION_SCHEMAS.contains(&self.version)
             && self.kind == "build-script"
+            && self.archive_timestamps.as_deref().is_none_or(valid_string)
             && self.binary_action.validate().is_ok()
             && valid_optional_string_map(&self.cargo_environment)
             && valid_optional_string_map(&self.environment)
@@ -395,6 +467,7 @@ impl BuildScriptAction {
                 .iter()
                 .all(|(path, input)| valid_string(path) && !path.is_empty() && input.validate(0))
             && self.out_dir.as_deref().is_none_or(valid_string)
+            && self.checkout.as_deref().is_none_or(valid_string)
     }
 }
 
@@ -404,7 +477,7 @@ impl BuildScriptInput {
             return false;
         }
         match self {
-            Self::Missing => true,
+            Self::Missing | Self::BlockedByFile => true,
             Self::File { digest } | Self::Directory { digest } => digest.validate().is_ok(),
             Self::Symlink { target, referent } => {
                 valid_string(target) && referent.validate(depth + 1)

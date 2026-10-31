@@ -157,7 +157,10 @@ async fn capabilities(State(state): State<AppState>) -> impl IntoResponse {
     capabilities.digest_algorithms = vec!["blake3".into(), "sha256".into()];
     capabilities.compressors = vec!["identity".into(), "zstd".into()];
     capabilities.action_kinds = BTreeMap::from([
-        ("build-script".into(), ActionKindCapability::new(2, 1)),
+        (
+            "build-script".into(),
+            ActionKindCapability::new(*crate::model::BUILD_SCRIPT_ACTION_SCHEMAS.end(), 1),
+        ),
         ("cc".into(), ActionKindCapability::new(1, 1)),
         ("rustc".into(), ActionKindCapability::new(1, 1)),
         ("task".into(), ActionKindCapability::new(1, 1)),
@@ -1025,7 +1028,9 @@ fn validate_build_script_action(
     value: serde_json::Value,
     version: u64,
 ) -> Result<ActionKind, ApiError> {
-    if version != 2 {
+    if !u8::try_from(version)
+        .is_ok_and(|version| crate::model::BUILD_SCRIPT_ACTION_SCHEMAS.contains(&version))
+    {
         return Err(ApiError::unprocessable(format!(
             "unsupported build-script action schema {version}"
         )));
@@ -2188,7 +2193,7 @@ mod tests {
                 .unwrap();
         assert_eq!(body["action_kinds"]["task"]["action_schema"], 1);
         assert_eq!(body["action_kinds"]["task"]["metadata_schema"], 1);
-        assert_eq!(body["action_kinds"]["build-script"]["action_schema"], 2);
+        assert_eq!(body["action_kinds"]["build-script"]["action_schema"], 5);
         assert_eq!(body["action_kinds"]["build-script"]["metadata_schema"], 1);
         assert_eq!(body["action_kinds"]["cc"]["action_schema"], 1);
         assert_eq!(body["action_kinds"]["cc"]["metadata_schema"], 1);
@@ -3010,39 +3015,126 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_unknown_rustc_action_fields() {
+    async fn ignores_unknown_action_fields() {
         let (app, _directory) = test_app().await;
         let source = digest(b"pub fn widget() {}\n");
         let mut action: serde_json::Value =
             serde_json::from_slice(&rustc_action(&source, 1)).unwrap();
         action["unknown"] = true.into();
-        let action = upload_blob(&app, &canonical(action)).await;
-        let result_uri = format!(
+        action["compiler"]["unknown"] = true.into();
+        assert_eq!(
+            publish_compiler_result(&app, &canonical(action), "rustc").await,
+            StatusCode::CREATED
+        );
+    }
+
+    /// Descriptors serialized by the client releases named in each file, so a
+    /// client schema change that the service cannot read fails here first.
+    #[tokio::test]
+    async fn accepts_client_action_descriptors() {
+        for (kind, action) in [
+            (
+                "rustc",
+                &include_bytes!("../tests/fixtures/client-actions/rustc-mbx-1.29.0.json")[..],
+            ),
+            (
+                "cc",
+                include_bytes!("../tests/fixtures/client-actions/cc-mbx-1.29.0.json"),
+            ),
+            (
+                "build-script",
+                include_bytes!("../tests/fixtures/client-actions/build-script-mbx-1.28.0.json"),
+            ),
+            (
+                "build-script",
+                include_bytes!("../tests/fixtures/client-actions/build-script-mbx-1.29.0.json"),
+            ),
+        ] {
+            let (app, _directory) = test_app().await;
+            assert_eq!(
+                publish_compiler_result(&app, action, kind).await,
+                StatusCode::CREATED,
+                "{kind}: {}",
+                String::from_utf8_lossy(action)
+            );
+        }
+
+        let (app, _directory) = test_app().await;
+        let action = upload_blob(
+            &app,
+            include_bytes!("../tests/fixtures/client-actions/task-mise-2026.10.24.json"),
+        )
+        .await;
+        let metadata = upload_blob(&app, &task_metadata("task", 1)).await;
+        let uri = format!(
             "/v1/action-results/{}/{}/{}",
             action.algorithm, action.hash, action.size
         );
         let body = serde_json::to_vec(&ActionResult {
             action,
-            metadata: None,
+            metadata: Some(metadata),
             output_root: None,
             version: 1,
         })
         .unwrap();
-
-        let response = app
-            .oneshot(request("PUT", result_uri, Body::from(body)))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-        let body: serde_json::Value =
-            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
-                .unwrap();
-        assert!(
-            body["error"]
-                .as_str()
+        assert_eq!(
+            app.oneshot(request("PUT", uri, Body::from(body)))
+                .await
                 .unwrap()
-                .starts_with("invalid rustc action:")
+                .status(),
+            StatusCode::CREATED
         );
+    }
+
+    #[tokio::test]
+    async fn rejects_unknown_action_kinds_and_schemas() {
+        let (app, _directory) = test_app().await;
+        let source = digest(b"pub fn widget() {}\n");
+        let mut unknown_kind: serde_json::Value =
+            serde_json::from_slice(&rustc_action(&source, 1)).unwrap();
+        unknown_kind["kind"] = "linker".into();
+        for (action, error) in [
+            (
+                canonical(unknown_kind),
+                "unsupported action kind \"linker\"",
+            ),
+            (
+                build_script_action(&source, 1),
+                "unsupported build-script action schema 1",
+            ),
+            (
+                build_script_action(&source, 6),
+                "unsupported build-script action schema 6",
+            ),
+            (
+                rustc_action(&source, 2),
+                "unsupported rustc action schema 2",
+            ),
+            (cc_action(&source, 2), "unsupported cc action schema 2"),
+        ] {
+            let action = upload_blob(&app, &action).await;
+            let uri = format!(
+                "/v1/action-results/{}/{}/{}",
+                action.algorithm, action.hash, action.size
+            );
+            let body = serde_json::to_vec(&ActionResult {
+                action,
+                metadata: None,
+                output_root: None,
+                version: 1,
+            })
+            .unwrap();
+            let response = app
+                .clone()
+                .oneshot(request("PUT", uri, Body::from(body)))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            let body: serde_json::Value =
+                serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            assert_eq!(body["error"], error);
+        }
     }
 
     #[tokio::test]
