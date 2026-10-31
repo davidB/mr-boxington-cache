@@ -53,6 +53,7 @@ async fn main() -> Result<()> {
         )
         .await?,
         config.max_blob_bytes,
+        config.pack_store_concurrency as usize,
     );
     let app = server::router(state);
     let listener = TcpListener::bind(config.listen).await?;
