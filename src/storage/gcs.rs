@@ -14,6 +14,17 @@ use uuid::Uuid;
 use super::{Blob, BlobStore, PutOutcome};
 use crate::{config::Config, model::Digest};
 
+/// The most a blob may hold to go up in one request. It matches the buffer
+/// `BufWriter` fills before it switches to a multipart upload, so the memory a
+/// put holds is unchanged.
+const SINGLE_REQUEST_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Whether a blob goes up in one create-only request rather than through a
+/// staged upload and a copy.
+fn fits_one_request(size: u64) -> bool {
+    size <= SINGLE_REQUEST_BYTES
+}
+
 /// A Google Cloud Storage-backed content-addressed blob store.
 pub struct GcsStore {
     store: Arc<dyn ObjectStore>,
@@ -79,12 +90,14 @@ impl BlobStore for GcsStore {
 
     async fn put(&self, digest: &Digest, source: &Path) -> anyhow::Result<PutOutcome> {
         let destination_key = self.key(digest);
-        if digest.size == 0 {
+        // GCS makes a single-request upload conditional (ifGenerationMatch=0),
+        // which saves the staging upload, copy, and delete below.
+        if fits_one_request(digest.size) {
             let result = self
                 .store
                 .put_opts(
                     &destination_key,
-                    Vec::new().into(),
+                    tokio::fs::read(source).await?.into(),
                     PutOptions {
                         mode: PutMode::Create,
                         ..Default::default()
@@ -191,6 +204,49 @@ mod tests {
         let store =
             GcsStore::from_store(Arc::new(backend), &format!("tests/{}/v1", Uuid::new_v4()));
         exercise(store, false).await;
+    }
+
+    #[test]
+    fn sends_blobs_up_to_the_buffer_size_in_one_request() {
+        assert!(fits_one_request(0));
+        assert!(fits_one_request(SINGLE_REQUEST_BYTES));
+        assert!(!fits_one_request(SINGLE_REQUEST_BYTES + 1));
+    }
+
+    #[tokio::test]
+    async fn leaves_no_staged_upload_on_either_side_of_the_threshold() {
+        let backend = Arc::new(InMemory::new());
+        let store = GcsStore::from_store(backend.clone(), "v1");
+        for size in [SINGLE_REQUEST_BYTES, SINGLE_REQUEST_BYTES + 1] {
+            let bytes = vec![7_u8; size as usize];
+            let source = tempfile::NamedTempFile::new().unwrap();
+            tokio::fs::write(source.path(), &bytes).await.unwrap();
+            let digest = Digest {
+                algorithm: Algorithm::Sha256.into(),
+                hash: hex::encode(Sha256::digest(&bytes)),
+                size,
+            };
+
+            assert_eq!(
+                store.put(&digest, source.path()).await.unwrap(),
+                PutOutcome::Created
+            );
+            assert_eq!(
+                store.put(&digest, source.path()).await.unwrap(),
+                PutOutcome::AlreadyExists
+            );
+            let blob = store.get(&digest).await.unwrap().unwrap();
+            assert_eq!(
+                blob.stream.try_collect::<Vec<_>>().await.unwrap().concat(),
+                bytes
+            );
+        }
+        let staged: Vec<_> = backend
+            .list(Some(&ObjectPath::from("v1/uploads")))
+            .try_collect()
+            .await
+            .unwrap();
+        assert!(staged.is_empty(), "{staged:?}");
     }
 
     async fn exercise(store: GcsStore, enforces_preconditions: bool) {

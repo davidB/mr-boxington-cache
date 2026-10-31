@@ -53,6 +53,7 @@ pub struct AppState {
     pub metadata: Arc<dyn MetadataStore>,
     pub auth: Authorizer,
     pub max_blob_bytes: u64,
+    pub pack_store_concurrency: usize,
     metrics: Arc<Metrics>,
 }
 
@@ -62,12 +63,14 @@ impl AppState {
         metadata: Arc<dyn MetadataStore>,
         auth: Authorizer,
         max_blob_bytes: u64,
+        pack_store_concurrency: usize,
     ) -> Self {
         Self {
             blobs,
             metadata,
             auth,
             max_blob_bytes,
+            pack_store_concurrency,
             metrics: Arc::new(Metrics::new()),
         }
     }
@@ -288,9 +291,11 @@ struct BlobPackReceipt {
 /// request at a time spends most of its time in round trips. Each frame is
 /// verified against the digest it declares before it is stored, exactly as a
 /// single upload is: a pack is a transport for uploads, not a weaker kind of
-/// one. A frame that fails ends the request, which may leave the blobs before
-/// it stored -- they are content-addressed and immutable, so storing one that a
-/// client then re-sends individually costs nothing but the transfer.
+/// one. Up to `pack_store_concurrency` frames are stored at once, because each
+/// store is a round trip to object storage. A frame that fails ends the
+/// request once the stores in flight finish, which may leave other blobs of the
+/// pack stored -- they are content-addressed and immutable, so storing one that
+/// a client then re-sends individually costs nothing but the transfer.
 async fn put_blob_pack(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -312,33 +317,57 @@ async fn put_blob_pack(
     let mut reader = PackReader::new(state.max_blob_bytes, declared_blobs, declared_bytes);
     let mut stream = body.into_data_stream();
     let mut frame: Option<PackFrame> = None;
-    let mut created = 0;
-    let mut existing = 0;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| ApiError::bad_request(error.to_string()))?;
-        for event in reader.push(&chunk).map_err(pack_error)? {
-            match event {
-                PackEvent::Started(digest) => {
-                    frame = Some(PackFrame::new(digest).await?);
-                }
-                PackEvent::Payload(payload) => {
-                    frame
-                        .as_mut()
-                        .ok_or_else(|| ApiError::internal("payload outside a blob pack frame"))?
-                        .write(&payload)
-                        .await?;
-                }
-                PackEvent::Complete => {
-                    let finished = frame.take().ok_or_else(|| {
-                        ApiError::internal("blob pack frame ended before it began")
-                    })?;
-                    match finished.store(&state, &namespace).await? {
-                        PutOutcome::Created => created += 1,
-                        PutOutcome::AlreadyExists => existing += 1,
+    // Spawned rather than polled in place: a dropped request detaches its
+    // stores instead of cutting one off between staging and cleanup.
+    let mut stores = stream::FuturesUnordered::new();
+    let mut receipt = BlobPackReceipt {
+        created: 0,
+        existing: 0,
+    };
+    let read = async {
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|error| ApiError::bad_request(error.to_string()))?;
+            for event in reader.push(&chunk).map_err(pack_error)? {
+                match event {
+                    PackEvent::Started(digest) => {
+                        frame = Some(PackFrame::new(digest).await?);
+                    }
+                    PackEvent::Payload(payload) => {
+                        frame
+                            .as_mut()
+                            .ok_or_else(|| ApiError::internal("payload outside a blob pack frame"))?
+                            .write(&payload)
+                            .await?;
+                    }
+                    PackEvent::Complete => {
+                        let mut finished = frame.take().ok_or_else(|| {
+                            ApiError::internal("blob pack frame ended before it began")
+                        })?;
+                        finished.verify().await?;
+                        // Waiting here also bounds the spooled frames on disk.
+                        if stores.len() >= state.pack_store_concurrency
+                            && let Some(stored) = stores.next().await
+                        {
+                            receipt.count(stored)?;
+                        }
+                        let state = state.clone();
+                        let namespace = namespace.clone();
+                        stores.push(tokio::spawn(async move {
+                            finished.store(&state, &namespace).await
+                        }));
                     }
                 }
             }
         }
+        while let Some(stored) = stores.next().await {
+            receipt.count(stored)?;
+        }
+        Ok::<_, ApiError>(())
+    }
+    .await;
+    if let Err(error) = read {
+        while stores.next().await.is_some() {}
+        return Err(error);
     }
     reader.finish().map_err(pack_error)?;
     if reader.blobs() != declared_blobs || reader.payload_bytes() != declared_bytes {
@@ -349,9 +378,22 @@ async fn put_blob_pack(
     state.metrics.inc_blob_pack_upload(reader.blobs());
     Ok((
         [(header::CONTENT_TYPE, BLOB_PACK_RECEIPT_MEDIA_TYPE)],
-        Json(BlobPackReceipt { created, existing }),
+        Json(receipt),
     )
         .into_response())
+}
+
+impl BlobPackReceipt {
+    fn count(
+        &mut self,
+        stored: Result<Result<PutOutcome, ApiError>, tokio::task::JoinError>,
+    ) -> Result<(), ApiError> {
+        match stored.map_err(ApiError::internal)?? {
+            PutOutcome::Created => self.created += 1,
+            PutOutcome::AlreadyExists => self.existing += 1,
+        }
+        Ok(())
+    }
 }
 
 /// One frame of an uploaded pack, spooled and hashed as it arrives.
@@ -402,8 +444,8 @@ impl PackFrame {
             .map_err(ApiError::internal)
     }
 
-    /// Verify and publish a completed frame as an ordinary blob upload.
-    async fn store(mut self, state: &AppState, namespace: &str) -> Result<PutOutcome, ApiError> {
+    /// Check a completed frame against the digest it declared.
+    async fn verify(&mut self) -> Result<(), ApiError> {
         self.file.flush().await.map_err(ApiError::internal)?;
         let actual = match self
             .digest
@@ -411,13 +453,18 @@ impl PackFrame {
             .map_err(ApiError::bad_request)?
         {
             Algorithm::Blake3 => self.blake3.finalize().to_hex().to_string(),
-            Algorithm::Sha256 => hex::encode(self.sha256.finalize()),
+            Algorithm::Sha256 => hex::encode(std::mem::take(&mut self.sha256).finalize()),
         };
         if self.size != self.digest.size || actual != self.digest.hash {
             return Err(ApiError::bad_request(
                 "packed blob does not match its declared digest",
             ));
         }
+        Ok(())
+    }
+
+    /// Publish a verified frame as an ordinary blob upload.
+    async fn store(self, state: &AppState, namespace: &str) -> Result<PutOutcome, ApiError> {
         let outcome = state
             .blobs
             .put(&self.digest, self.temp.path())
@@ -1461,7 +1508,7 @@ mod tests {
         let metadata = Arc::new(MemoryMetadata::default());
         let auth = Authorizer::new(None, None, true, None).await.unwrap();
         (
-            router(AppState::new(blobs, metadata, auth, 1024 * 1024)),
+            router(AppState::new(blobs, metadata, auth, 1024 * 1024, 8)),
             directory,
         )
     }
@@ -1707,7 +1754,7 @@ mod tests {
         let metadata = Arc::new(MemoryMetadata::default());
         let auth = Authorizer::new(None, None, true, None).await.unwrap();
         (
-            router(AppState::new(blobs, metadata, auth, max_blob_bytes)),
+            router(AppState::new(blobs, metadata, auth, max_blob_bytes, 8)),
             directory,
         )
     }
@@ -2405,6 +2452,122 @@ mod tests {
         }
     }
 
+    /// A blob store whose writes take a fixed time, like a remote object store.
+    struct SlowStore {
+        inner: FilesystemStore,
+        delay: std::time::Duration,
+        fail: Option<Digest>,
+        started: std::sync::atomic::AtomicUsize,
+        finished: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for SlowStore {
+        async fn get(&self, digest: &Digest) -> anyhow::Result<Option<crate::storage::Blob>> {
+            self.inner.get(digest).await
+        }
+
+        async fn put(
+            &self,
+            digest: &Digest,
+            source: &std::path::Path,
+        ) -> anyhow::Result<PutOutcome> {
+            self.started
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail.as_ref() == Some(digest) {
+                anyhow::bail!("storage refused the blob");
+            }
+            tokio::time::sleep(self.delay).await;
+            let outcome = self.inner.put(digest, source).await;
+            self.finished
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            outcome
+        }
+    }
+
+    async fn app_with_slow_store(
+        delay: std::time::Duration,
+        fail: Option<Digest>,
+    ) -> (Router, Arc<SlowStore>, tempfile::TempDir) {
+        let directory = tempfile::tempdir().unwrap();
+        let blobs = Arc::new(SlowStore {
+            inner: FilesystemStore::new(directory.path()).await.unwrap(),
+            delay,
+            fail,
+            started: Default::default(),
+            finished: Default::default(),
+        });
+        let metadata = Arc::new(MemoryMetadata::default());
+        let auth = Authorizer::new(None, None, true, None).await.unwrap();
+        (
+            router(AppState::new(blobs.clone(), metadata, auth, 1024 * 1024, 8)),
+            blobs,
+            directory,
+        )
+    }
+
+    fn numbered_pack(count: usize) -> (Vec<Digest>, Vec<u8>, u64) {
+        let payloads: Vec<Vec<u8>> = (0..count)
+            .map(|index| format!("packed blob {index}").into_bytes())
+            .collect();
+        let digests: Vec<Digest> = payloads.iter().map(|bytes| digest(bytes)).collect();
+        let entries: Vec<(&Digest, &[u8])> = digests
+            .iter()
+            .zip(&payloads)
+            .map(|(digest, bytes)| (digest, bytes.as_slice()))
+            .collect();
+        let bytes = digests.iter().map(|digest| digest.size).sum();
+        let pack = encode_blob_pack(&entries);
+        (digests, pack, bytes)
+    }
+
+    #[tokio::test]
+    async fn stores_the_blobs_of_a_pack_concurrently() {
+        let delay = std::time::Duration::from_millis(200);
+        let (app, store, _directory) = app_with_slow_store(delay, None).await;
+        let (digests, pack, bytes) = numbered_pack(16);
+
+        let started = Instant::now();
+        let response = app
+            .oneshot(pack_request(pack, digests.len() as u64, bytes))
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["created"], 16);
+        assert_eq!(body["existing"], 0);
+        assert_eq!(store.finished.load(std::sync::atomic::Ordering::SeqCst), 16);
+        eprintln!("16 blobs, 200 ms per put: {elapsed:?}");
+        // In turn this is 16 x 200 ms; eight at a time it is about 2 x 200 ms.
+        assert!(elapsed < delay * 6, "took {elapsed:?}");
+    }
+
+    #[tokio::test]
+    async fn fails_a_pack_when_one_store_fails_after_the_others_finish() {
+        let (digests, pack, bytes) = numbered_pack(16);
+        let (app, store, _directory) = app_with_slow_store(
+            std::time::Duration::from_millis(50),
+            Some(digests[0].clone()),
+        )
+        .await;
+
+        let response = app
+            .oneshot(pack_request(pack, digests.len() as u64, bytes))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        // Every other store that began ran to its end before the response, so
+        // none was cut off between staging and cleanup.
+        let started = store.started.load(std::sync::atomic::Ordering::SeqCst);
+        let finished = store.finished.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(finished, started - 1);
+    }
+
     #[tokio::test]
     async fn counts_blobs_an_uploaded_pack_already_held() {
         let (app, _directory) = test_app().await;
@@ -2450,6 +2613,23 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn stores_nothing_after_a_packed_blob_that_does_not_match_its_digest() {
+        let (app, store, _directory) = app_with_slow_store(std::time::Duration::ZERO, None).await;
+        let claimed = digest(b"claimed contents");
+        let (_, rest, bytes) = numbered_pack(4);
+        let mut pack = encode_blob_pack(&[(&claimed, b"swapped contents".as_slice())]);
+        pack.extend_from_slice(&rest[BLOB_PACK_MAGIC.len()..]);
+
+        let response = app
+            .oneshot(pack_request(pack, 5, claimed.size + bytes))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(store.started.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
